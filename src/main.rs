@@ -1342,6 +1342,230 @@ min-publish-age = "gibberish"
         assert!(resolve_min_age(&cli).is_err());
     }
 
+    // ---------------- fetch_stable_versions (mocked crates.io) ----------------
+
+    fn test_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn fetch_returns_stable_versions_sorted_newest_first() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "1.0.0", "created_at": "2024-01-01T00:00:00Z", "yanked": false},
+                        {"num": "1.0.5", "created_at": "2024-03-01T00:00:00Z", "yanked": false},
+                        {"num": "1.0.3", "created_at": "2024-02-01T00:00:00Z", "yanked": false}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.num.as_str()).collect::<Vec<_>>(),
+            vec!["1.0.5", "1.0.3", "1.0.0"]
+        );
+    }
+
+    #[test]
+    fn fetch_filters_out_yanked_versions() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "1.0.0", "created_at": "2024-01-01T00:00:00Z", "yanked": false},
+                        {"num": "1.0.1", "created_at": "2024-02-01T00:00:00Z", "yanked": true},
+                        {"num": "1.0.2", "created_at": "2024-03-01T00:00:00Z", "yanked": false}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        let nums: Vec<&str> = versions.iter().map(|v| v.num.as_str()).collect();
+        assert_eq!(nums, vec!["1.0.2", "1.0.0"]);
+    }
+
+    #[test]
+    fn fetch_filters_out_prerelease_versions() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "1.0.0", "created_at": "2024-01-01T00:00:00Z", "yanked": false},
+                        {"num": "2.0.0-alpha", "created_at": "2024-02-01T00:00:00Z", "yanked": false},
+                        {"num": "2.0.0-rc.1", "created_at": "2024-03-01T00:00:00Z", "yanked": false},
+                        {"num": "1.5.0", "created_at": "2024-01-15T00:00:00Z", "yanked": false}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        let nums: Vec<&str> = versions.iter().map(|v| v.num.as_str()).collect();
+        assert_eq!(nums, vec!["1.5.0", "1.0.0"]);
+    }
+
+    #[test]
+    fn fetch_keeps_versions_with_build_metadata() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/toml")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "1.1.2+spec-1.1.0", "created_at": "2025-04-01T00:00:00Z", "yanked": false}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "toml", &server.url()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].num, "1.1.2+spec-1.1.0");
+    }
+
+    #[test]
+    fn fetch_returns_empty_when_all_versions_are_prerelease_or_yanked() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/newcrate")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "0.1.0-alpha", "created_at": "2024-01-01T00:00:00Z", "yanked": false},
+                        {"num": "0.1.0-beta", "created_at": "2024-01-05T00:00:00Z", "yanked": false},
+                        {"num": "0.1.0", "created_at": "2024-01-10T00:00:00Z", "yanked": true}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "newcrate", &server.url()).unwrap();
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn fetch_returns_empty_when_versions_array_is_empty() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/empty")
+            .with_body(r#"{"versions": []}"#)
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "empty", &server.url()).unwrap();
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn fetch_errors_on_404_crate_not_found() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/nonexistent")
+            .with_status(404)
+            .with_body(r#"{"errors": [{"detail": "Not Found"}]}"#)
+            .create();
+
+        let err = fetch_stable_versions_from(&test_client(), "nonexistent", &server.url())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn fetch_errors_on_5xx() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/broken")
+            .with_status(503)
+            .create();
+
+        let err = fetch_stable_versions_from(&test_client(), "broken", &server.url())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("503") || err.contains("HTTP"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn fetch_errors_on_malformed_json() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/bad")
+            .with_status(200)
+            .with_body("this is definitely not json")
+            .create();
+
+        let err = fetch_stable_versions_from(&test_client(), "bad", &server.url())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON") || err.contains("invalid"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn fetch_errors_on_unexpected_json_shape() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/wrong")
+            .with_body(r#"{"not_versions": []}"#)
+            .create();
+
+        assert!(fetch_stable_versions_from(&test_client(), "wrong", &server.url()).is_err());
+    }
+
+    #[test]
+    fn fetch_trims_trailing_slash_from_base_url() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/foo")
+            .with_body(r#"{"versions": []}"#)
+            .create();
+
+        let mut url = server.url();
+        url.push('/');
+        // Should NOT try to hit /<empty>/foo — trailing slash is trimmed.
+        assert!(fetch_stable_versions_from(&test_client(), "foo", &url).is_ok());
+    }
+
+    #[test]
+    fn fetch_yanked_defaults_to_false_when_field_missing() {
+        // The serde default on VersionInfo.yanked ensures API responses without
+        // the `yanked` key are treated as not-yanked.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/legacy")
+            .with_body(
+                r#"{
+                    "versions": [
+                        {"num": "1.0.0", "created_at": "2024-01-01T00:00:00Z"}
+                    ]
+                }"#,
+            )
+            .create();
+
+        let versions =
+            fetch_stable_versions_from(&test_client(), "legacy", &server.url()).unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
     #[test]
     fn resolve_min_age_returns_none_when_neither_set() {
         let td = TempDir::new().unwrap();
