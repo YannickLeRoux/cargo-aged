@@ -71,7 +71,10 @@ With `--dry-run`, the `updating...` lines change to `would update (dry-run)` and
 2. For each registry dependency, GETs `https://crates.io/api/v1/crates/<name>` with a descriptive `User-Agent` (per the crates.io fair-use policy).
 3. Picks the newest version that is not yanked and not a pre-release.
 4. If `(now - published_at) >= min_age`, shells out to `cargo update -p <crate> --precise <version> --manifest-path <path>`.
-5. Prints a summary of updated vs skipped counts.
+5. If that `cargo update` fails (typically because another direct dep transitively constrains this crate to a newer range), retries with the next-older age-eligible version — up to 5 attempts per crate — and reports the successful pin, or the last error if all attempts fail.
+6. Prints a summary of updated vs skipped counts.
+
+The age constraint is applied **only to the direct dependencies you declare in `Cargo.toml`**. Transitive deps are left to Cargo's normal resolver.
 
 Your `Cargo.toml` is never modified — only `Cargo.lock` is touched, via `cargo update`.
 

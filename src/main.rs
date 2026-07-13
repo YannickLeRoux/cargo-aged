@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 const USER_AGENT: &str = concat!("cargo-aged/", env!("CARGO_PKG_VERSION"));
 const CRATES_IO_API: &str = "https://crates.io/api/v1/crates";
+const MAX_UPDATE_ATTEMPTS: usize = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -109,55 +110,132 @@ fn run(cli: Cli) -> Result<()> {
                     continue;
                 }
 
-                match fetch_latest_stable(&client, &dep.name) {
-                    Ok(Some(latest)) => {
-                        let age_days = (now - latest.created_at).num_days();
-                        if age_days >= cli.min_age {
-                            let label = format!("{} {}", dep.name, latest.num);
-                            if cli.dry_run {
-                                println!(
-                                    "  ✓ {:<24} — {} days old, would update (dry-run)",
-                                    label, age_days
-                                );
-                                updated += 1;
-                            } else {
-                                println!(
-                                    "  ✓ {:<24} — {} days old, updating...",
-                                    label, age_days
-                                );
-                                match run_cargo_update(&dep.name, &latest.num, &cli.manifest_path) {
-                                    Ok(()) => updated += 1,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "    ! cargo update failed for {}: {}",
-                                            dep.name, e
-                                        );
-                                        skipped += 1;
-                                    }
-                                }
-                            }
-                        } else {
-                            let label = format!("{} {}", dep.name, latest.num);
-                            println!(
-                                "  ✗ {:<24} — {} days old, skipping",
-                                label, age_days
-                            );
-                            skipped += 1;
-                        }
-
-                        if cli.verbose {
-                            println!(
-                                "      (published {})",
-                                latest.created_at.to_rfc3339()
-                            );
-                        }
-                    }
-                    Ok(None) => {
+                match fetch_stable_versions(&client, &dep.name) {
+                    Ok(versions) if versions.is_empty() => {
                         eprintln!(
                             "  ! {:<24} no stable release found — skipping",
                             dep.name
                         );
                         skipped += 1;
+                    }
+                    Ok(versions) => {
+                        let newest = &versions[0];
+                        let newest_age = (now - newest.created_at).num_days();
+
+                        if newest_age < cli.min_age {
+                            let label = format!("{} {}", dep.name, newest.num);
+                            println!(
+                                "  ✗ {:<24} — {} days old, skipping",
+                                label, newest_age
+                            );
+                            if cli.verbose {
+                                println!(
+                                    "      (published {})",
+                                    newest.created_at.to_rfc3339()
+                                );
+                            }
+                            skipped += 1;
+                            continue;
+                        }
+
+                        let eligible: Vec<&StableVersion> = versions
+                            .iter()
+                            .filter(|v| (now - v.created_at).num_days() >= cli.min_age)
+                            .collect();
+                        let attempts = eligible.len().min(MAX_UPDATE_ATTEMPTS);
+                        let candidates = &eligible[..attempts];
+
+                        let top = candidates[0];
+                        let top_age = (now - top.created_at).num_days();
+                        let top_label = format!("{} {}", dep.name, top.num);
+
+                        if cli.dry_run {
+                            println!(
+                                "  ✓ {:<24} — {} days old, would update (dry-run)",
+                                top_label, top_age
+                            );
+                            if cli.verbose {
+                                println!(
+                                    "      (published {})",
+                                    top.created_at.to_rfc3339()
+                                );
+                            }
+                            updated += 1;
+                            continue;
+                        }
+
+                        println!(
+                            "  ✓ {:<24} — {} days old, updating...",
+                            top_label, top_age
+                        );
+                        if cli.verbose {
+                            println!("      (published {})", top.created_at.to_rfc3339());
+                        }
+
+                        let mut pinned: Option<(&StableVersion, i64)> = None;
+                        let mut last_err: Option<String> = None;
+
+                        for (idx, candidate) in candidates.iter().enumerate() {
+                            let age = (now - candidate.created_at).num_days();
+
+                            if idx > 0 {
+                                println!(
+                                    "    → retrying with {} {} ({} days old)...",
+                                    dep.name, candidate.num, age
+                                );
+                            }
+
+                            match run_cargo_update(
+                                &dep.name,
+                                &candidate.num,
+                                &cli.manifest_path,
+                            ) {
+                                Ok(()) => {
+                                    pinned = Some((*candidate, age));
+                                    break;
+                                }
+                                Err(e) => {
+                                    last_err = Some(format!("{}", e));
+                                    if cli.verbose {
+                                        eprintln!(
+                                            "      cargo update failed for {} {}: {}",
+                                            dep.name, candidate.num, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        match pinned {
+                            Some((v, age)) => {
+                                if !std::ptr::eq(v, top) {
+                                    println!(
+                                        "    ✓ pinned {} {} ({} days old)",
+                                        dep.name, v.num, age
+                                    );
+                                }
+                                updated += 1;
+                            }
+                            None => {
+                                let hint = if eligible.len() > attempts {
+                                    format!(
+                                        " (tried {} of {} eligible versions; increase MAX_UPDATE_ATTEMPTS to try more)",
+                                        attempts,
+                                        eligible.len()
+                                    )
+                                } else {
+                                    format!(" (tried all {} eligible versions)", attempts)
+                                };
+                                eprintln!(
+                                    "    ! no compatible age-eligible version for {}{}",
+                                    dep.name, hint
+                                );
+                                if let Some(e) = last_err {
+                                    eprintln!("      last error: {}", e);
+                                }
+                                skipped += 1;
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -301,15 +379,15 @@ struct VersionInfo {
 }
 
 #[derive(Debug, Clone)]
-struct LatestStable {
+struct StableVersion {
     num: String,
     created_at: DateTime<Utc>,
 }
 
-fn fetch_latest_stable(
+fn fetch_stable_versions(
     client: &reqwest::blocking::Client,
     name: &str,
-) -> Result<Option<LatestStable>> {
+) -> Result<Vec<StableVersion>> {
     let url = format!("{}/{}", CRATES_IO_API, name);
     let resp = client
         .get(&url)
@@ -325,17 +403,18 @@ fn fetch_latest_stable(
 
     let body: CratesResponse = resp.json().context("invalid JSON from crates.io")?;
 
-    let latest = body
+    let mut versions: Vec<StableVersion> = body
         .versions
         .into_iter()
         .filter(|v| !v.yanked && is_stable(&v.num))
-        .max_by_key(|v| v.created_at)
-        .map(|v| LatestStable {
+        .map(|v| StableVersion {
             num: v.num,
             created_at: v.created_at,
-        });
+        })
+        .collect();
 
-    Ok(latest)
+    versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(versions)
 }
 
 fn is_stable(version: &str) -> bool {
@@ -349,7 +428,7 @@ fn is_stable(version: &str) -> bool {
 }
 
 fn run_cargo_update(name: &str, version: &str, manifest_path: &PathBuf) -> Result<()> {
-    let status = Command::new("cargo")
+    let output = Command::new("cargo")
         .arg("update")
         .arg("-p")
         .arg(name)
@@ -357,13 +436,17 @@ fn run_cargo_update(name: &str, version: &str, manifest_path: &PathBuf) -> Resul
         .arg(version)
         .arg("--manifest-path")
         .arg(manifest_path)
-        .status()
+        .output()
         .context("failed to spawn `cargo update`")?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = stderr.trim();
+        let summary = msg.lines().next().unwrap_or("").trim();
         return Err(anyhow!(
-            "cargo update exited with status {}",
-            status.code().unwrap_or(-1)
+            "cargo update exited with status {}: {}",
+            output.status.code().unwrap_or(-1),
+            if summary.is_empty() { "no stderr output" } else { summary }
         ));
     }
     Ok(())
