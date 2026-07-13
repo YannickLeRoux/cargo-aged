@@ -38,6 +38,7 @@ cargo aged --min-age 90 --dry-run
 | `--manifest-path <PATH>` | `./Cargo.toml` | Path to the `Cargo.toml` to read. |
 | `--dry-run` | off | Print what would be updated without changing `Cargo.lock`. |
 | `--verbose` | off | Also print the publish timestamp for each crate. |
+| `--iterate` | off | Repeat passes until a full pass makes no changes (bounded at 10 passes). Useful for tightly-coupled dep families like `serde` + `serde_json` that can only be downgraded in stages. |
 | `-h`, `--help` | | Print help. |
 | `-V`, `--version` | | Print version. |
 
@@ -47,6 +48,7 @@ cargo aged --min-age 90 --dry-run
 - **Git dependencies** (`git = "..."`) — same.
 - **`=`-pinned requirements** (`serde = "=1.0.210"`) — the pin is treated as an explicit choice and left alone.
 - **Crates whose latest stable version is younger than `--min-age`.**
+- **Crates already locked to an age-eligible version** — reported as `= serde 1.0.210 — already age-eligible` and left alone. Note this means `cargo-aged` won't proactively upgrade one age-eligible version to a newer age-eligible version within the same major; pair it with a plain `cargo update` first if you want to move forward before aging back.
 - **Crates that 404 on crates.io or whose API call fails** — a warning is printed and the crate is skipped.
 
 Yanked releases and pre-release versions (anything with a `-` suffix, e.g. `1.0.0-rc.1`) are ignored when picking the "latest stable" version.
@@ -70,9 +72,11 @@ With `--dry-run`, the `updating...` lines change to `would update (dry-run)` and
 1. Parses your `Cargo.toml` (including `[dev-dependencies]`, `[build-dependencies]`, `[target.*.dependencies]`, and `[workspace.dependencies]`).
 2. For each registry dependency, GETs `https://crates.io/api/v1/crates/<name>` with a descriptive `User-Agent` (per the crates.io fair-use policy).
 3. Picks the newest version that is not yanked and not a pre-release.
-4. If `(now - published_at) >= min_age`, shells out to `cargo update -p <crate> --precise <version> --manifest-path <path>`.
-5. If that `cargo update` fails (typically because another direct dep transitively constrains this crate to a newer range), retries with the next-older age-eligible version — up to 5 attempts per crate — and reports the successful pin, or the last error if all attempts fail.
-6. Prints a summary of updated vs skipped counts.
+4. Reads `Cargo.lock` and skips the crate if any age-eligible version is already locked (prevents redundant work and lets `--iterate` converge).
+5. If `(now - published_at) >= min_age`, shells out to `cargo update -p <crate> --precise <version> --manifest-path <path>`.
+6. If that `cargo update` fails (typically because another direct dep transitively constrains this crate to a newer range), retries with the next-older age-eligible version — up to 5 attempts per crate — and reports the successful pin, or the last error if all attempts fail.
+7. With `--iterate`, repeats the whole pass until a pass produces zero updates (fixed point), bounded at 10 passes.
+8. Prints a summary of updated vs skipped counts.
 
 The age constraint is applied **only to the direct dependencies you declare in `Cargo.toml`**. Transitive deps are left to Cargo's normal resolver.
 

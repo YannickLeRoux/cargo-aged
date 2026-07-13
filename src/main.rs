@@ -11,6 +11,7 @@ use serde::Deserialize;
 const USER_AGENT: &str = concat!("cargo-aged/", env!("CARGO_PKG_VERSION"));
 const CRATES_IO_API: &str = "https://crates.io/api/v1/crates";
 const MAX_UPDATE_ATTEMPTS: usize = 5;
+const MAX_ITERATE_PASSES: usize = 10;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,6 +36,12 @@ struct Cli {
 
     #[arg(long, help = "Show publish dates and age for all crates checked")]
     verbose: bool,
+
+    #[arg(
+        long,
+        help = "Repeat passes until no more updates apply (fixed point). Useful when tightly-coupled dep families (e.g. serde + serde_json) can only be downgraded in stages."
+    )]
+    iterate: bool,
 }
 
 fn main() {
@@ -73,22 +80,65 @@ fn run(cli: Cli) -> Result<()> {
     let deps = parse_manifest(&cli.manifest_path)
         .with_context(|| format!("failed to parse manifest at {}", cli.manifest_path.display()))?;
 
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    if cli.iterate && cli.dry_run {
+        eprintln!("note: --iterate has no effect with --dry-run; running a single pass.");
+    }
+
+    let iterate = cli.iterate && !cli.dry_run;
+
+    if !iterate {
+        let (updated, skipped) = run_pass(&client, &cli, &deps)?;
+        println!("Summary: {} updated, {} skipped.", updated, skipped);
+        return Ok(());
+    }
+
+    let mut total_updated = 0usize;
+    for pass in 1..=MAX_ITERATE_PASSES {
+        println!("=== Pass {} ===", pass);
+        let (updated, skipped) = run_pass(&client, &cli, &deps)?;
+        println!(
+            "Pass {} summary: {} updated, {} skipped.",
+            pass, updated, skipped
+        );
+        total_updated += updated;
+
+        if updated == 0 {
+            println!(
+                "Converged after {} pass(es). Total updates applied: {}.",
+                pass, total_updated
+            );
+            return Ok(());
+        }
+    }
+
+    println!(
+        "Stopped after {} passes (cap reached). Total updates applied: {}.",
+        MAX_ITERATE_PASSES, total_updated
+    );
+    Ok(())
+}
+
+fn run_pass(
+    client: &reqwest::blocking::Client,
+    cli: &Cli,
+    deps: &[Dependency],
+) -> Result<(usize, usize)> {
     println!(
         "Checking {} dependencies (min-age: {} days)...",
         deps.len(),
         cli.min_age
     );
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .context("failed to build HTTP client")?;
-
     let mut updated = 0usize;
     let mut skipped = 0usize;
     let now = Utc::now();
 
-    for dep in &deps {
+    for dep in deps {
         match &dep.kind {
             DepKind::Path => {
                 println!("  ✗ {:<24} (path dep)    — skipping", dep.name);
@@ -142,6 +192,27 @@ fn run(cli: Cli) -> Result<()> {
                             .iter()
                             .filter(|v| (now - v.created_at).num_days() >= cli.min_age)
                             .collect();
+
+                        let locked = locked_versions(&cli.manifest_path, &dep.name);
+                        if let Some(current) =
+                            eligible.iter().find(|v| locked.iter().any(|l| l == &v.num))
+                        {
+                            let age = (now - current.created_at).num_days();
+                            let label = format!("{} {}", dep.name, current.num);
+                            println!(
+                                "  = {:<24} — {} days old, already age-eligible",
+                                label, age
+                            );
+                            if cli.verbose {
+                                println!(
+                                    "      (published {})",
+                                    current.created_at.to_rfc3339()
+                                );
+                            }
+                            skipped += 1;
+                            continue;
+                        }
+
                         let attempts = eligible.len().min(MAX_UPDATE_ATTEMPTS);
                         let candidates = &eligible[..attempts];
 
@@ -249,8 +320,7 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    println!("Summary: {} updated, {} skipped.", updated, skipped);
-    Ok(())
+    Ok((updated, skipped))
 }
 
 fn parse_manifest(path: &PathBuf) -> Result<Vec<Dependency>> {
@@ -425,6 +495,35 @@ fn is_stable(version: &str) -> bool {
         Some((_, pre)) => pre.is_empty(),
         None => true,
     }
+}
+
+fn locked_versions(manifest_path: &PathBuf, name: &str) -> Vec<String> {
+    let lock_path = manifest_path
+        .parent()
+        .map(|p| p.join("Cargo.lock"))
+        .unwrap_or_else(|| PathBuf::from("Cargo.lock"));
+
+    let Ok(contents) = fs::read_to_string(&lock_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(packages) = value.get("package").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    packages
+        .iter()
+        .filter_map(|p| {
+            let table = p.as_table()?;
+            let pkg_name = table.get("name")?.as_str()?;
+            if pkg_name != name {
+                return None;
+            }
+            table.get("version")?.as_str().map(str::to_string)
+        })
+        .collect()
 }
 
 fn run_cargo_update(name: &str, version: &str, manifest_path: &PathBuf) -> Result<()> {
