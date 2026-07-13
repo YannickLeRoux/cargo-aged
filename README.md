@@ -30,11 +30,33 @@ cargo aged --min-age 14          # more aggressive
 cargo aged --min-age 90 --dry-run
 ```
 
+### Configuring `min-publish-age`
+
+`cargo-aged` reads the same config key that upcoming Cargo `-Zmin-publish-age` support ([tracking issue #17009](https://github.com/rust-lang/cargo/issues/17009), [RFC #3923](https://github.com/rust-lang/rfcs/pull/3923)) uses. Put this in your project's `.cargo/config.toml`:
+
+```toml
+[registry]
+min-publish-age = "14 days"
+```
+
+Accepted values: `"N days"` / `"N day"` / `"N weeks"` / `"N week"`, or a bare integer meaning days.
+
+**Precedence (highest wins)**:
+
+1. `--min-age <DAYS>` on the CLI
+2. `[registry].min-publish-age` in `.cargo/config.toml` — searched from the manifest's directory up to the root, then `$CARGO_HOME/config.toml` (default `~/.cargo/config.toml`)
+
+If neither is set, `cargo-aged` exits with an error rather than guessing a default — you have to opt in to a specific threshold. Use plain `cargo update` if you don't want any age filtering.
+
+When the value comes from a config file, the effective threshold and its source are printed at the top of the run.
+
+Once Cargo's `-Zmin-publish-age` is stable, the same config file will govern both the resolver and this tool.
+
 ### Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--min-age <DAYS>` | `30` | Minimum release age in days before a crate is eligible for update. |
+| `--min-age <DAYS>` | see below | Minimum release age in days before a crate is eligible for update. Overrides `.cargo/config.toml`. Required if no config file provides one — the tool exits with an error otherwise. |
 | `--manifest-path <PATH>` | `./Cargo.toml` | Path to the `Cargo.toml` to read. |
 | `--dry-run` | off | Print what would be updated without changing `Cargo.lock`. |
 | `--verbose` | off | Also print the publish timestamp for each crate. |
