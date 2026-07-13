@@ -1,0 +1,88 @@
+# cargo-aged
+
+A Cargo subcommand that updates dependencies **only when their latest stable release has aged past a configurable threshold**. Useful for teams that want to avoid pulling in freshly-published crate versions before the ecosystem has had a chance to shake out bugs, supply-chain issues, or yanks.
+
+For each dependency in your `Cargo.toml`, `cargo-aged` queries the crates.io API for the newest non-prerelease, non-yanked version. If that version was published at least *N* days ago, it runs `cargo update -p <crate> --precise <version>` to pin your `Cargo.lock` to it.
+
+## Install
+
+From source (from this repo):
+
+```sh
+cargo install --path .
+```
+
+Or install directly from a git checkout:
+
+```sh
+cargo install --git https://github.com/YannickLeRoux/cargo-aged.git
+```
+
+Once installed, the `cargo-aged` binary lives in `~/.cargo/bin/`, which Cargo picks up as the `cargo aged` subcommand.
+
+## Usage
+
+Run inside any Cargo project:
+
+```sh
+cargo aged                       # default: 30-day minimum age
+cargo aged --min-age 14          # more aggressive
+cargo aged --min-age 90 --dry-run
+```
+
+### Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--min-age <DAYS>` | `30` | Minimum release age in days before a crate is eligible for update. |
+| `--manifest-path <PATH>` | `./Cargo.toml` | Path to the `Cargo.toml` to read. |
+| `--dry-run` | off | Print what would be updated without changing `Cargo.lock`. |
+| `--verbose` | off | Also print the publish timestamp for each crate. |
+| `-h`, `--help` | | Print help. |
+| `-V`, `--version` | | Print version. |
+
+### What gets skipped
+
+- **Path dependencies** (`path = "..."`) — nothing to fetch from crates.io.
+- **Git dependencies** (`git = "..."`) — same.
+- **`=`-pinned requirements** (`serde = "=1.0.210"`) — the pin is treated as an explicit choice and left alone.
+- **Crates whose latest stable version is younger than `--min-age`.**
+- **Crates that 404 on crates.io or whose API call fails** — a warning is printed and the crate is skipped.
+
+Yanked releases and pre-release versions (anything with a `-` suffix, e.g. `1.0.0-rc.1`) are ignored when picking the "latest stable" version.
+
+### Example output
+
+```
+Checking 12 dependencies (min-age: 30 days)...
+  ✓ serde 1.0.210            — 45 days old, updating...
+  ✗ tokio 1.38.0             — 8 days old, skipping
+  ✗ reqwest (git dep)        — skipping
+  ✓ clap 4.5.4               — 62 days old, updating...
+  ...
+Summary: 3 updated, 9 skipped.
+```
+
+With `--dry-run`, the `updating...` lines change to `would update (dry-run)` and no `cargo update` is invoked.
+
+## How it works
+
+1. Parses your `Cargo.toml` (including `[dev-dependencies]`, `[build-dependencies]`, `[target.*.dependencies]`, and `[workspace.dependencies]`).
+2. For each registry dependency, GETs `https://crates.io/api/v1/crates/<name>` with a descriptive `User-Agent` (per the crates.io fair-use policy).
+3. Picks the newest version that is not yanked and not a pre-release.
+4. If `(now - published_at) >= min_age`, shells out to `cargo update -p <crate> --precise <version> --manifest-path <path>`.
+5. Prints a summary of updated vs skipped counts.
+
+Your `Cargo.toml` is never modified — only `Cargo.lock` is touched, via `cargo update`.
+
+## Development
+
+```sh
+cargo build
+cargo run -- aged --dry-run                       # test against this repo's own manifest
+cargo run -- aged --dry-run --manifest-path ../other-project/Cargo.toml
+```
+
+## License
+
+MIT OR Apache-2.0
