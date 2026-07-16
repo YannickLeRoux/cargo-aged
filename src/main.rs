@@ -46,6 +46,13 @@ struct Cli {
         help = "Repeat passes until no more updates apply (fixed point). Useful when tightly-coupled dep families (e.g. serde + serde_json) can only be downgraded in stages."
     )]
     iterate: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["dry_run", "iterate"],
+        help = "Read-only CI gate: exit 1 if Cargo.lock contains any direct dep locked to a version younger than min-age (and an age-eligible replacement exists). Does not modify Cargo.lock. Mutually exclusive with --dry-run and --iterate."
+    )]
+    check: bool,
 }
 
 fn main() {
@@ -61,9 +68,12 @@ fn main() {
 
     let cli = Cli::parse_from(filtered);
 
-    if let Err(err) = run(cli) {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
+    match run(cli) {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -80,7 +90,7 @@ struct Dependency {
     kind: DepKind,
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<i32> {
     let deps = parse_manifest(&cli.manifest_path)
         .with_context(|| format!("failed to parse manifest at {}", cli.manifest_path.display()))?;
 
@@ -104,12 +114,16 @@ fn run(cli: Cli) -> Result<()> {
         println!("{}", note);
     }
 
+    if cli.check {
+        return Ok(run_check(&client, &cli, min_age, &deps, CRATES_IO_API));
+    }
+
     let iterate = cli.iterate && !cli.dry_run;
 
     if !iterate {
         let (updated, skipped) = run_pass(&client, &cli, min_age, &deps)?;
         println!("Summary: {} updated, {} skipped.", updated, skipped);
-        return Ok(());
+        return Ok(0);
     }
 
     let mut total_updated = 0usize;
@@ -127,7 +141,7 @@ fn run(cli: Cli) -> Result<()> {
                 "Converged after {} pass(es). Total updates applied: {}.",
                 pass, total_updated
             );
-            return Ok(());
+            return Ok(0);
         }
     }
 
@@ -135,7 +149,229 @@ fn run(cli: Cli) -> Result<()> {
         "Stopped after {} passes (cap reached). Total updates applied: {}.",
         MAX_ITERATE_PASSES, total_updated
     );
-    Ok(())
+    Ok(0)
+}
+
+/// Classification of a single dep for --check purposes.
+/// The decision is: given crates.io versions and Cargo.lock state, would the
+/// tool consider this dep to need pinning back to an older, age-eligible release?
+#[derive(Debug, Clone)]
+enum DepStatus {
+    /// Locked to a version that isn't age-eligible, but an age-eligible
+    /// version does exist on crates.io. This is the CI-fail signal.
+    Fresh {
+        locked_version: String,
+        locked_age: Option<i64>,
+        locked_published: Option<DateTime<Utc>>,
+        eligible_top: String,
+        eligible_top_age: i64,
+        eligible_top_published: DateTime<Utc>,
+    },
+    /// Already locked to an age-eligible version.
+    Ok {
+        version: String,
+        age: i64,
+        published: DateTime<Utc>,
+    },
+    Skipped(SkipReason),
+}
+
+#[derive(Debug, Clone)]
+enum SkipReason {
+    Path,
+    Git,
+    Pinned(String),
+    NoStable,
+    NoEligible { newest_age: i64 },
+    LookupFailed(String),
+}
+
+fn classify_dep(
+    client: &reqwest::blocking::Client,
+    dep: &Dependency,
+    manifest_path: &Path,
+    min_age: i64,
+    now: DateTime<Utc>,
+    base_url: &str,
+) -> DepStatus {
+    match &dep.kind {
+        DepKind::Path => DepStatus::Skipped(SkipReason::Path),
+        DepKind::Git => DepStatus::Skipped(SkipReason::Git),
+        DepKind::Registry { req, pinned } => {
+            if *pinned {
+                return DepStatus::Skipped(SkipReason::Pinned(req.clone()));
+            }
+            let versions = match fetch_stable_versions_from(client, &dep.name, base_url) {
+                Ok(v) => v,
+                Err(e) => return DepStatus::Skipped(SkipReason::LookupFailed(e.to_string())),
+            };
+            if versions.is_empty() {
+                return DepStatus::Skipped(SkipReason::NoStable);
+            }
+            let newest = &versions[0];
+            let newest_age = (now - newest.created_at).num_days();
+
+            let eligible: Vec<&StableVersion> = versions
+                .iter()
+                .filter(|v| (now - v.created_at).num_days() >= min_age)
+                .collect();
+
+            if eligible.is_empty() {
+                return DepStatus::Skipped(SkipReason::NoEligible { newest_age });
+            }
+
+            let locked = locked_versions(manifest_path, &dep.name);
+            if let Some(current) = eligible.iter().find(|v| locked.iter().any(|l| l == &v.num)) {
+                let age = (now - current.created_at).num_days();
+                return DepStatus::Ok {
+                    version: current.num.clone(),
+                    age,
+                    published: current.created_at,
+                };
+            }
+
+            let top = eligible[0];
+            let top_age = (now - top.created_at).num_days();
+
+            let (locked_version, locked_age, locked_published) = if let Some(l) = locked.first() {
+                let v = versions.iter().find(|v| &v.num == l);
+                (
+                    l.clone(),
+                    v.map(|v| (now - v.created_at).num_days()),
+                    v.map(|v| v.created_at),
+                )
+            } else {
+                (newest.num.clone(), Some(newest_age), Some(newest.created_at))
+            };
+
+            DepStatus::Fresh {
+                locked_version,
+                locked_age,
+                locked_published,
+                eligible_top: top.num.clone(),
+                eligible_top_age: top_age,
+                eligible_top_published: top.created_at,
+            }
+        }
+    }
+}
+
+fn run_check(
+    client: &reqwest::blocking::Client,
+    cli: &Cli,
+    min_age: i64,
+    deps: &[Dependency],
+    base_url: &str,
+) -> i32 {
+    println!(
+        "Checking {} dependencies (min-age: {} days)...",
+        deps.len(),
+        min_age
+    );
+
+    let now = Utc::now();
+    let mut fresh_count = 0usize;
+    let mut ok_count = 0usize;
+    let mut skipped_count = 0usize;
+
+    for dep in deps {
+        let status = classify_dep(client, dep, &cli.manifest_path, min_age, now, base_url);
+        match status {
+            DepStatus::Fresh {
+                locked_version,
+                locked_age,
+                locked_published,
+                eligible_top,
+                eligible_top_age,
+                eligible_top_published,
+            } => {
+                let label = format!("{} {}", dep.name, locked_version);
+                let age_str = locked_age
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "?".into());
+                println!(
+                    "  ✓ {:<24} — {} days old, TOO FRESH (min-age {})",
+                    label, age_str, min_age
+                );
+                if cli.verbose {
+                    if let Some(p) = locked_published {
+                        println!("      (published {})", p.to_rfc3339());
+                    }
+                    println!(
+                        "      would pin to {} {} ({} days old, published {})",
+                        dep.name,
+                        eligible_top,
+                        eligible_top_age,
+                        eligible_top_published.to_rfc3339()
+                    );
+                }
+                fresh_count += 1;
+            }
+            DepStatus::Ok {
+                version,
+                age,
+                published,
+            } => {
+                let label = format!("{} {}", dep.name, version);
+                println!(
+                    "  = {:<24} — {} days old, already age-eligible",
+                    label, age
+                );
+                if cli.verbose {
+                    println!("      (published {})", published.to_rfc3339());
+                }
+                ok_count += 1;
+            }
+            DepStatus::Skipped(reason) => {
+                match reason {
+                    SkipReason::Path => {
+                        println!("  ✗ {:<24} (path dep)    — skipping", dep.name);
+                    }
+                    SkipReason::Git => {
+                        println!("  ✗ {:<24} (git dep)     — skipping", dep.name);
+                    }
+                    SkipReason::Pinned(req) => {
+                        println!("  ✗ {:<24} (= {}) pinned  — skipping", dep.name, req);
+                    }
+                    SkipReason::NoStable => {
+                        eprintln!(
+                            "  ! {:<24} no stable release found — skipping",
+                            dep.name
+                        );
+                    }
+                    SkipReason::NoEligible { newest_age } => {
+                        let label = dep.name.clone();
+                        println!(
+                            "  ✗ {:<24} — newest is {} days old, no age-eligible version, skipping",
+                            label, newest_age
+                        );
+                    }
+                    SkipReason::LookupFailed(e) => {
+                        eprintln!(
+                            "  ! {:<24} crates.io lookup failed ({}) — skipping",
+                            dep.name, e
+                        );
+                    }
+                }
+                skipped_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "Check: {} too fresh, {} ok, {} skipped.",
+        fresh_count, ok_count, skipped_count
+    );
+
+    if fresh_count > 0 {
+        eprintln!(
+            "error: {} direct dependency(ies) violate min-age of {} days.",
+            fresh_count, min_age
+        );
+        1
+    } else {
+        0
+    }
 }
 
 fn run_pass(
@@ -658,7 +894,7 @@ fn cargo_home() -> Option<PathBuf> {
     None
 }
 
-fn locked_versions(manifest_path: &PathBuf, name: &str) -> Vec<String> {
+fn locked_versions(manifest_path: &Path, name: &str) -> Vec<String> {
     let lock_path = manifest_path
         .parent()
         .map(|p| p.join("Cargo.lock"))
@@ -1312,6 +1548,7 @@ min-publish-age = "gibberish"
             dry_run: false,
             verbose: false,
             iterate: false,
+            check: false,
         }
     }
 
@@ -1581,5 +1818,337 @@ min-publish-age = "gibberish"
             return;
         }
         assert!(resolve_min_age(&cli).unwrap().is_none());
+    }
+
+    // ---------------- --check mode ----------------
+
+    use chrono::Duration;
+
+    fn check_cli(manifest_path: PathBuf) -> Cli {
+        Cli {
+            min_age: Some(30),
+            manifest_path,
+            dry_run: false,
+            verbose: false,
+            iterate: false,
+            check: true,
+        }
+    }
+
+    fn iso(dt: DateTime<Utc>) -> String {
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn write_manifest_and_lock(td: &TempDir, manifest: &str, lock: &str) -> PathBuf {
+        let manifest_path = td.path().join("Cargo.toml");
+        fs::write(&manifest_path, manifest).unwrap();
+        fs::write(td.path().join("Cargo.lock"), lock).unwrap();
+        manifest_path
+    }
+
+    #[test]
+    fn check_returns_zero_when_all_locked_versions_are_age_eligible() {
+        let now = Utc::now();
+        let old_a = now - Duration::days(200);
+        let old_b = now - Duration::days(150);
+
+        let mut server = mockito::Server::new();
+        let _ma = server
+            .mock("GET", "/serde")
+            .with_body(format!(
+                r#"{{"versions":[{{"num":"1.0.100","created_at":"{}","yanked":false}}]}}"#,
+                iso(old_a)
+            ))
+            .create();
+        let _mb = server
+            .mock("GET", "/tokio")
+            .with_body(format!(
+                r#"{{"versions":[{{"num":"1.30.0","created_at":"{}","yanked":false}}]}}"#,
+                iso(old_b)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest = r#"
+[package]
+name = "x"
+version = "0.1.0"
+[dependencies]
+serde = "1.0"
+tokio = "1"
+"#;
+        let lock = r#"
+[[package]]
+name = "serde"
+version = "1.0.100"
+
+[[package]]
+name = "tokio"
+version = "1.30.0"
+"#;
+        let manifest_path = write_manifest_and_lock(&td, manifest, lock);
+        let deps = parse_manifest(&manifest_path).unwrap();
+        let cli = check_cli(manifest_path);
+        let code = run_check(&test_client(), &cli, 30, &deps, &server.url());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn check_returns_one_when_locked_version_is_too_fresh_and_eligible_exists() {
+        let now = Utc::now();
+        let old = now - Duration::days(200);
+        let fresh = now - Duration::days(5);
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(format!(
+                r#"{{"versions":[
+                    {{"num":"1.0.200","created_at":"{}","yanked":false}},
+                    {{"num":"1.0.100","created_at":"{}","yanked":false}}
+                ]}}"#,
+                iso(fresh),
+                iso(old)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
+        // Cargo.lock is holding the too-fresh version.
+        let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n";
+        let manifest_path = write_manifest_and_lock(&td, manifest, lock);
+        let deps = parse_manifest(&manifest_path).unwrap();
+        let cli = check_cli(manifest_path);
+        let code = run_check(&test_client(), &cli, 30, &deps, &server.url());
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn check_treats_dep_with_no_eligible_replacement_as_skipped_not_fresh() {
+        let now = Utc::now();
+        // Every published version is too fresh.
+        let fresh_a = now - Duration::days(5);
+        let fresh_b = now - Duration::days(10);
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/newcrate")
+            .with_body(format!(
+                r#"{{"versions":[
+                    {{"num":"0.2.0","created_at":"{}","yanked":false}},
+                    {{"num":"0.1.0","created_at":"{}","yanked":false}}
+                ]}}"#,
+                iso(fresh_a),
+                iso(fresh_b)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nnewcrate = \"0.2\"\n";
+        let lock = "[[package]]\nname = \"newcrate\"\nversion = \"0.2.0\"\n";
+        let manifest_path = write_manifest_and_lock(&td, manifest, lock);
+        let deps = parse_manifest(&manifest_path).unwrap();
+        let cli = check_cli(manifest_path);
+        let code = run_check(&test_client(), &cli, 30, &deps, &server.url());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn check_conflicts_with_dry_run_at_parse_time() {
+        let err = Cli::try_parse_from([
+            "cargo-aged",
+            "--check",
+            "--dry-run",
+            "--min-age",
+            "30",
+        ])
+        .unwrap_err();
+        // clap surfaces the conflict as an ArgumentConflict error kind.
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn check_conflicts_with_iterate_at_parse_time() {
+        let err = Cli::try_parse_from([
+            "cargo-aged",
+            "--check",
+            "--iterate",
+            "--min-age",
+            "30",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn check_does_not_touch_cargo_lock() {
+        let now = Utc::now();
+        let fresh = now - Duration::days(5);
+        let old = now - Duration::days(200);
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(format!(
+                r#"{{"versions":[
+                    {{"num":"1.0.200","created_at":"{}","yanked":false}},
+                    {{"num":"1.0.100","created_at":"{}","yanked":false}}
+                ]}}"#,
+                iso(fresh),
+                iso(old)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
+        // Lock is at the too-fresh version — the "guard would act" case.
+        let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n";
+        let manifest_path = write_manifest_and_lock(&td, manifest, lock);
+        let lock_path = td.path().join("Cargo.lock");
+
+        let before = fs::read(&lock_path).unwrap();
+        let deps = parse_manifest(&manifest_path).unwrap();
+        let cli = check_cli(manifest_path);
+        let code = run_check(&test_client(), &cli, 30, &deps, &server.url());
+        let after = fs::read(&lock_path).unwrap();
+
+        assert_eq!(code, 1);
+        assert_eq!(before, after, "Cargo.lock must be byte-identical after --check");
+    }
+
+    #[test]
+    fn classify_dep_marks_path_dep_as_skipped() {
+        let td = TempDir::new().unwrap();
+        let manifest_path = td.path().join("Cargo.toml");
+        fs::write(&manifest_path, "[package]\nname=\"x\"\nversion=\"0.1.0\"\n").unwrap();
+
+        let dep = Dependency {
+            name: "local".into(),
+            kind: DepKind::Path,
+        };
+        let status = classify_dep(
+            &test_client(),
+            &dep,
+            &manifest_path,
+            30,
+            Utc::now(),
+            "http://unused.invalid",
+        );
+        assert!(matches!(status, DepStatus::Skipped(SkipReason::Path)));
+    }
+
+    #[test]
+    fn classify_dep_marks_equals_pin_as_skipped() {
+        let td = TempDir::new().unwrap();
+        let manifest_path = td.path().join("Cargo.toml");
+        fs::write(&manifest_path, "[package]\nname=\"x\"\nversion=\"0.1.0\"\n").unwrap();
+
+        let dep = Dependency {
+            name: "serde".into(),
+            kind: DepKind::Registry {
+                req: "=1.0.210".into(),
+                pinned: true,
+            },
+        };
+        let status = classify_dep(
+            &test_client(),
+            &dep,
+            &manifest_path,
+            30,
+            Utc::now(),
+            "http://unused.invalid",
+        );
+        assert!(matches!(
+            status,
+            DepStatus::Skipped(SkipReason::Pinned(_))
+        ));
+    }
+
+    #[test]
+    fn classify_dep_marks_locked_eligible_version_as_ok() {
+        let now = Utc::now();
+        let old = now - Duration::days(200);
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(format!(
+                r#"{{"versions":[{{"num":"1.0.100","created_at":"{}","yanked":false}}]}}"#,
+                iso(old)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest_path = td.path().join("Cargo.toml");
+        fs::write(&manifest_path, "[package]\nname=\"x\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            td.path().join("Cargo.lock"),
+            "[[package]]\nname=\"serde\"\nversion=\"1.0.100\"\n",
+        )
+        .unwrap();
+
+        let dep = Dependency {
+            name: "serde".into(),
+            kind: DepKind::Registry {
+                req: "1.0".into(),
+                pinned: false,
+            },
+        };
+        let status =
+            classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
+        match status {
+            DepStatus::Ok { version, .. } => assert_eq!(version, "1.0.100"),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dep_marks_locked_fresh_version_with_older_eligible_as_fresh() {
+        let now = Utc::now();
+        let fresh = now - Duration::days(5);
+        let old = now - Duration::days(200);
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/serde")
+            .with_body(format!(
+                r#"{{"versions":[
+                    {{"num":"1.0.200","created_at":"{}","yanked":false}},
+                    {{"num":"1.0.100","created_at":"{}","yanked":false}}
+                ]}}"#,
+                iso(fresh),
+                iso(old)
+            ))
+            .create();
+
+        let td = TempDir::new().unwrap();
+        let manifest_path = td.path().join("Cargo.toml");
+        fs::write(&manifest_path, "[package]\nname=\"x\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            td.path().join("Cargo.lock"),
+            "[[package]]\nname=\"serde\"\nversion=\"1.0.200\"\n",
+        )
+        .unwrap();
+
+        let dep = Dependency {
+            name: "serde".into(),
+            kind: DepKind::Registry {
+                req: "1.0".into(),
+                pinned: false,
+            },
+        };
+        let status =
+            classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
+        match status {
+            DepStatus::Fresh {
+                locked_version,
+                eligible_top,
+                ..
+            } => {
+                assert_eq!(locked_version, "1.0.200");
+                assert_eq!(eligible_top, "1.0.100");
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
     }
 }

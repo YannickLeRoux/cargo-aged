@@ -30,6 +30,24 @@ cargo aged --min-age 14          # more aggressive
 cargo aged --min-age 90 --dry-run
 ```
 
+### CI usage
+
+Use `--check` as a read-only gate in CI to fail the build when `Cargo.lock` drifts to a version younger than the configured threshold:
+
+```sh
+cargo aged --check                # inherits min-age from .cargo/config.toml
+cargo aged --check --min-age 14   # or set it inline
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Every direct registry dep is either already locked to an age-eligible version or skipped for a legitimate reason (path/git dep, `=`-pin, no stable release, no age-eligible version exists, or crates.io lookup failed). |
+| `1` | At least one direct registry dep is locked to a version younger than `min-age` **and** an older age-eligible version exists on crates.io — i.e. running `cargo aged` (without `--check`) would pin something back. Any other error (missing threshold, bad manifest, HTTP failure) also uses exit `1`. |
+
+`--check` is mutually exclusive with `--dry-run` and `--iterate`: both are non-mutating, but `--check` is the one that sets a status code.
+
 ### Configuring `min-publish-age`
 
 `cargo-aged` reads the same config key that upcoming Cargo `-Zmin-publish-age` support ([tracking issue #17009](https://github.com/rust-lang/cargo/issues/17009), [RFC #3923](https://github.com/rust-lang/rfcs/pull/3923)) uses. Put this in your project's `.cargo/config.toml`:
@@ -61,6 +79,7 @@ Once Cargo's `-Zmin-publish-age` is stable, the same config file will govern bot
 | `--dry-run` | off | Print what would be updated without changing `Cargo.lock`. |
 | `--verbose` | off | Also print the publish timestamp for each crate. |
 | `--iterate` | off | Repeat passes until a full pass makes no changes (bounded at 10 passes). Useful for tightly-coupled dep families like `serde` + `serde_json` that can only be downgraded in stages. |
+| `--check` | off | Read-only CI gate. Exits `1` if `Cargo.lock` has any direct registry dep locked to a version younger than the threshold **and** an age-eligible replacement exists on crates.io. Does not modify `Cargo.lock` or shell out to `cargo update`. Mutually exclusive with `--dry-run` and `--iterate`. |
 | `-h`, `--help` | | Print help. |
 | `-V`, `--version` | | Print version. |
 
