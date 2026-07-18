@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -576,21 +576,61 @@ fn run_pass(
 }
 
 fn parse_manifest(path: &PathBuf) -> Result<Vec<Dependency>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    parse_manifest_str(&contents)
+    let mut out: BTreeMap<String, Dependency> = BTreeMap::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    parse_manifest_into(path, &mut out, &mut seen)?;
+    Ok(out.into_values().collect())
 }
 
+fn parse_manifest_into(
+    path: &Path,
+    out: &mut BTreeMap<String, Dependency>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(key) {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&contents)
+        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+
+    collect_deps_from_value(&value, out);
+
+    if let Some(ws) = value.get("workspace").and_then(|v| v.as_table()) {
+        if let Some(members) = ws.get("members").and_then(|v| v.as_array()) {
+            let root_dir = path.parent().unwrap_or_else(|| Path::new("."));
+            for m in members {
+                let Some(pat) = m.as_str() else { continue };
+                for member_dir in expand_member_pattern(root_dir, pat) {
+                    let member_manifest = member_dir.join("Cargo.toml");
+                    if member_manifest.is_file() {
+                        parse_manifest_into(&member_manifest, out, seen)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 fn parse_manifest_str(contents: &str) -> Result<Vec<Dependency>> {
     let value: toml::Value = toml::from_str(contents).context("invalid TOML in manifest")?;
-
     let mut out: BTreeMap<String, Dependency> = BTreeMap::new();
+    collect_deps_from_value(&value, &mut out);
+    Ok(out.into_values().collect())
+}
 
+fn collect_deps_from_value(value: &toml::Value, out: &mut BTreeMap<String, Dependency>) {
     let sections = ["dependencies", "dev-dependencies", "build-dependencies"];
 
     for section in sections {
         if let Some(table) = value.get(section).and_then(|v| v.as_table()) {
-            collect_deps(table, &mut out);
+            collect_deps(table, out);
         }
     }
 
@@ -599,7 +639,7 @@ fn parse_manifest_str(contents: &str) -> Result<Vec<Dependency>> {
             if let Some(t) = tv.as_table() {
                 for section in sections {
                     if let Some(table) = t.get(section).and_then(|v| v.as_table()) {
-                        collect_deps(table, &mut out);
+                        collect_deps(table, out);
                     }
                 }
             }
@@ -608,11 +648,67 @@ fn parse_manifest_str(contents: &str) -> Result<Vec<Dependency>> {
 
     if let Some(ws) = value.get("workspace").and_then(|v| v.as_table()) {
         if let Some(table) = ws.get("dependencies").and_then(|v| v.as_table()) {
-            collect_deps(table, &mut out);
+            collect_deps(table, out);
         }
     }
+}
 
-    Ok(out.into_values().collect())
+fn expand_member_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let has_wildcard = pattern.chars().any(|c| matches!(c, '*' | '?'));
+    if !has_wildcard {
+        let full = root.join(pattern);
+        return if full.is_dir() { vec![full] } else { vec![] };
+    }
+
+    let mut current = vec![root.to_path_buf()];
+    for comp in Path::new(pattern).components() {
+        let name = comp.as_os_str().to_string_lossy().into_owned();
+        let has_wc = name.contains('*') || name.contains('?');
+        let mut next: Vec<PathBuf> = Vec::new();
+        for base in &current {
+            if has_wc {
+                if let Ok(iter) = fs::read_dir(base) {
+                    for entry in iter.flatten() {
+                        let ent_name = entry.file_name().to_string_lossy().into_owned();
+                        if simple_glob_match(&ent_name, &name) {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                next.push(p);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let p = base.join(&name);
+                if p.is_dir() {
+                    next.push(p);
+                }
+            }
+        }
+        current = next;
+    }
+    current
+}
+
+fn simple_glob_match(name: &str, pat: &str) -> bool {
+    fn helper(n: &[u8], p: &[u8]) -> bool {
+        match (n.split_first(), p.split_first()) {
+            (_, Some((&b'*', rest_p))) => {
+                if helper(n, rest_p) {
+                    return true;
+                }
+                if let Some((_, rest_n)) = n.split_first() {
+                    return helper(rest_n, p);
+                }
+                false
+            }
+            (Some((_, rest_n)), Some((&b'?', rest_p))) => helper(rest_n, rest_p),
+            (Some((cn, rest_n)), Some((cp, rest_p))) if cn == cp => helper(rest_n, rest_p),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    helper(name.as_bytes(), pat.as_bytes())
 }
 
 fn collect_deps(table: &toml::value::Table, out: &mut BTreeMap<String, Dependency>) {
