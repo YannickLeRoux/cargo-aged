@@ -28,11 +28,7 @@ struct Cli {
     )]
     min_age: Option<i64>,
 
-    #[arg(
-        long,
-        default_value = "./Cargo.toml",
-        help = "Path to Cargo.toml"
-    )]
+    #[arg(long, default_value = "./Cargo.toml", help = "Path to Cargo.toml")]
     manifest_path: PathBuf,
 
     #[arg(long, help = "Print what would be updated without making changes")]
@@ -91,8 +87,12 @@ struct Dependency {
 }
 
 fn run(cli: Cli) -> Result<i32> {
-    let deps = parse_manifest(&cli.manifest_path)
-        .with_context(|| format!("failed to parse manifest at {}", cli.manifest_path.display()))?;
+    let deps = parse_manifest(&cli.manifest_path).with_context(|| {
+        format!(
+            "failed to parse manifest at {}",
+            cli.manifest_path.display()
+        )
+    })?;
 
     let Some((min_age, source_note)) = resolve_min_age(&cli)? else {
         return Err(anyhow!(
@@ -241,7 +241,11 @@ fn classify_dep(
                     v.map(|v| v.created_at),
                 )
             } else {
-                (newest.num.clone(), Some(newest_age), Some(newest.created_at))
+                (
+                    newest.num.clone(),
+                    Some(newest_age),
+                    Some(newest.created_at),
+                )
             };
 
             DepStatus::Fresh {
@@ -313,10 +317,7 @@ fn run_check(
                 published,
             } => {
                 let label = format!("{} {}", dep.name, version);
-                println!(
-                    "  = {:<24} — {} days old, already age-eligible",
-                    label, age
-                );
+                println!("  = {:<24} — {} days old, already age-eligible", label, age);
                 if cli.verbose {
                     println!("      (published {})", published.to_rfc3339());
                 }
@@ -334,10 +335,7 @@ fn run_check(
                         println!("  ✗ {:<24} (= {}) pinned  — skipping", dep.name, req);
                     }
                     SkipReason::NoStable => {
-                        eprintln!(
-                            "  ! {:<24} no stable release found — skipping",
-                            dep.name
-                        );
+                        eprintln!("  ! {:<24} no stable release found — skipping", dep.name);
                     }
                     SkipReason::NoEligible { newest_age } => {
                         let label = dep.name.clone();
@@ -404,35 +402,34 @@ fn run_pass(
             }
             DepKind::Registry { req, pinned } => {
                 if *pinned {
-                    println!(
-                        "  ✗ {:<24} (= {}) pinned  — skipping",
-                        dep.name, req
-                    );
+                    println!("  ✗ {:<24} (= {}) pinned  — skipping", dep.name, req);
                     skipped += 1;
                     continue;
                 }
 
                 match fetch_stable_versions(&client, &dep.name) {
                     Ok(versions) if versions.is_empty() => {
-                        eprintln!(
-                            "  ! {:<24} no stable release found — skipping",
-                            dep.name
-                        );
+                        eprintln!("  ! {:<24} no stable release found — skipping", dep.name);
                         skipped += 1;
                     }
                     Ok(versions) => {
                         let newest = &versions[0];
                         let newest_age = (now - newest.created_at).num_days();
 
-                        if newest_age < min_age {
-                            let label = format!("{} {}", dep.name, newest.num);
+                        let eligible: Vec<&StableVersion> = versions
+                            .iter()
+                            .filter(|v| (now - v.created_at).num_days() >= min_age)
+                            .collect();
+
+                        if eligible.is_empty() {
                             println!(
-                                "  ✗ {:<24} — {} days old, skipping",
-                                label, newest_age
+                                "  ✗ {:<24} — newest is {} days old, no age-eligible version, skipping",
+                                dep.name, newest_age
                             );
                             if cli.verbose {
                                 println!(
-                                    "      (published {})",
+                                    "      (newest {} published {})",
+                                    newest.num,
                                     newest.created_at.to_rfc3339()
                                 );
                             }
@@ -440,26 +437,15 @@ fn run_pass(
                             continue;
                         }
 
-                        let eligible: Vec<&StableVersion> = versions
-                            .iter()
-                            .filter(|v| (now - v.created_at).num_days() >= min_age)
-                            .collect();
-
                         let locked = locked_versions(&cli.manifest_path, &dep.name);
                         if let Some(current) =
                             eligible.iter().find(|v| locked.iter().any(|l| l == &v.num))
                         {
                             let age = (now - current.created_at).num_days();
                             let label = format!("{} {}", dep.name, current.num);
-                            println!(
-                                "  = {:<24} — {} days old, already age-eligible",
-                                label, age
-                            );
+                            println!("  = {:<24} — {} days old, already age-eligible", label, age);
                             if cli.verbose {
-                                println!(
-                                    "      (published {})",
-                                    current.created_at.to_rfc3339()
-                                );
+                                println!("      (published {})", current.created_at.to_rfc3339());
                             }
                             skipped += 1;
                             continue;
@@ -478,19 +464,13 @@ fn run_pass(
                                 top_label, top_age
                             );
                             if cli.verbose {
-                                println!(
-                                    "      (published {})",
-                                    top.created_at.to_rfc3339()
-                                );
+                                println!("      (published {})", top.created_at.to_rfc3339());
                             }
                             updated += 1;
                             continue;
                         }
 
-                        println!(
-                            "  ✓ {:<24} — {} days old, updating...",
-                            top_label, top_age
-                        );
+                        println!("  ✓ {:<24} — {} days old, updating...", top_label, top_age);
                         if cli.verbose {
                             println!("      (published {})", top.created_at.to_rfc3339());
                         }
@@ -508,11 +488,8 @@ fn run_pass(
                                 );
                             }
 
-                            match run_cargo_update(
-                                &dep.name,
-                                &candidate.num,
-                                &cli.manifest_path,
-                            ) {
+                            let spec = build_pkg_spec(&dep.name, &candidate.num, &locked);
+                            match run_cargo_update(&spec, &candidate.num, &cli.manifest_path) {
                                 Ok(()) => {
                                     pinned = Some((*candidate, age));
                                     break;
@@ -592,10 +569,10 @@ fn parse_manifest_into(
         return Ok(());
     }
 
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    let value: toml::Value = toml::from_str(&contents)
-        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&contents).with_context(|| format!("invalid TOML in {}", path.display()))?;
 
     collect_deps_from_value(&value, out);
 
@@ -717,14 +694,12 @@ fn collect_deps(table: &toml::value::Table, out: &mut BTreeMap<String, Dependenc
         // First-seen wins so we don't downgrade a resolved registry dep by a later duplicate,
         // but we also don't want to lose a path/git signal — merge conservatively.
         out.entry(dep.name.clone())
-            .and_modify(|existing| {
-                match (&existing.kind, &dep.kind) {
-                    (DepKind::Registry { .. }, DepKind::Path)
-                    | (DepKind::Registry { .. }, DepKind::Git) => {
-                        existing.kind = dep.kind.clone();
-                    }
-                    _ => {}
+            .and_modify(|existing| match (&existing.kind, &dep.kind) {
+                (DepKind::Registry { .. }, DepKind::Path)
+                | (DepKind::Registry { .. }, DepKind::Git) => {
+                    existing.kind = dep.kind.clone();
                 }
+                _ => {}
             })
             .or_insert(dep);
     }
@@ -953,14 +928,14 @@ fn find_config_min_age_with_home(
 }
 
 fn read_config_min_age_from_file(path: &Path) -> Result<Option<i64>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))?;
     read_config_min_age_from_str(&contents, &path.display().to_string())
 }
 
 fn read_config_min_age_from_str(contents: &str, source: &str) -> Result<Option<i64>> {
-    let value: toml::Value = toml::from_str(contents)
-        .with_context(|| format!("invalid TOML in {}", source))?;
+    let value: toml::Value =
+        toml::from_str(contents).with_context(|| format!("invalid TOML in {}", source))?;
 
     let Some(registry) = value.get("registry").and_then(|v| v.as_table()) else {
         return Ok(None);
@@ -1023,11 +998,30 @@ fn locked_versions_from_str(contents: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn run_cargo_update(name: &str, version: &str, manifest_path: &PathBuf) -> Result<()> {
+// When the lockfile has more than one entry for the same crate (e.g. `syn 2.x` and
+// `syn 3.x`), `cargo update -p <name>` errors with "specification is ambiguous". Qualify
+// the spec with the locked version sharing the target's major so cargo knows which
+// instance to roll back.
+fn build_pkg_spec(name: &str, target: &str, locked: &[String]) -> String {
+    if locked.len() < 2 {
+        return name.to_string();
+    }
+    let target_major = target.split('.').next().unwrap_or("");
+    let chosen = locked
+        .iter()
+        .find(|v| v.split('.').next().unwrap_or("") == target_major)
+        .or_else(|| locked.first());
+    match chosen {
+        Some(v) => format!("{}@{}", name, v),
+        None => name.to_string(),
+    }
+}
+
+fn run_cargo_update(spec: &str, version: &str, manifest_path: &PathBuf) -> Result<()> {
     let output = Command::new("cargo")
         .arg("update")
         .arg("-p")
-        .arg(name)
+        .arg(spec)
         .arg("--precise")
         .arg(version)
         .arg("--manifest-path")
@@ -1042,7 +1036,11 @@ fn run_cargo_update(name: &str, version: &str, manifest_path: &PathBuf) -> Resul
         return Err(anyhow!(
             "cargo update exited with status {}: {}",
             output.status.code().unwrap_or(-1),
-            if summary.is_empty() { "no stderr output" } else { summary }
+            if summary.is_empty() {
+                "no stderr output"
+            } else {
+                summary
+            }
         ));
     }
     Ok(())
@@ -1223,17 +1221,18 @@ mod tests {
 
     #[test]
     fn path_wins_over_version_field() {
-        let v: toml::Value =
-            toml::from_str(r#"path = "../local"
-version = "1.0""#).unwrap();
+        let v: toml::Value = toml::from_str(
+            r#"path = "../local"
+version = "1.0""#,
+        )
+        .unwrap();
         let d = classify("local", &v);
         assert!(matches!(d.kind, DepKind::Path));
     }
 
     #[test]
     fn classifies_git_dependency() {
-        let v: toml::Value =
-            toml::from_str(r#"git = "https://github.com/foo/bar""#).unwrap();
+        let v: toml::Value = toml::from_str(r#"git = "https://github.com/foo/bar""#).unwrap();
         let d = classify("bar", &v);
         assert!(matches!(d.kind, DepKind::Git));
     }
@@ -1356,6 +1355,208 @@ version = "0.1.0"
         assert!(parse_manifest_str("this is not = valid ]").is_err());
     }
 
+    // ---------------- parse_manifest (workspace expansion) ----------------
+
+    #[test]
+    fn workspace_root_with_members_collects_member_deps() {
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate_a\"]\n",
+        );
+        write(
+            &td.path().join("crate_a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["serde"]);
+    }
+
+    #[test]
+    fn workspace_root_with_multiple_members_collects_all_deps() {
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        );
+        write(
+            &td.path().join("a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n",
+        );
+        write(
+            &td.path().join("b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n[dependencies]\ntokio = \"1\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["serde", "tokio"]);
+    }
+
+    #[test]
+    fn workspace_member_dev_and_build_deps_are_included() {
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"m\"]\n",
+        );
+        write(
+            &td.path().join("m/Cargo.toml"),
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nserde = \"1.0\"\n\
+             [dev-dependencies]\ntempfile = \"3\"\n\
+             [build-dependencies]\ncc = \"1\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["cc", "serde", "tempfile"]);
+    }
+
+    #[test]
+    fn workspace_root_workspace_dependencies_take_precedence_over_member_inherit() {
+        // Root defines the concrete version; member uses `workspace = true`.
+        // Root should be visited first so its Registry("1.0") wins over the
+        // member's empty-req Registry inherit stub.
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.dependencies]\nserde = \"1.0\"\n",
+        );
+        write(
+            &td.path().join("m/Cargo.toml"),
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nserde = {{ workspace = true }}\n"
+                .replace("{{", "{")
+                .replace("}}", "}")
+                .as_str(),
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(deps.len(), 1);
+        match &deps[0].kind {
+            DepKind::Registry { req, .. } => assert_eq!(req, "1.0"),
+            other => panic!("expected Registry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workspace_member_path_dep_overrides_registry_from_root() {
+        // Root's `[workspace.dependencies]` gives a registry entry;
+        // a member declares the same crate as a path dep. The path signal
+        // should override registry (matches non-workspace merge behavior).
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.dependencies]\nshared = \"1.0\"\n",
+        );
+        write(
+            &td.path().join("m/Cargo.toml"),
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nshared = { path = \"../shared\" }\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert!(matches!(deps[0].kind, DepKind::Path));
+    }
+
+    #[test]
+    fn workspace_root_and_member_deps_are_merged() {
+        // Both root has its own [dependencies] AND has a member with its own.
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"m\"]\n\
+             [dependencies]\nroot_only = \"1\"\n",
+        );
+        write(
+            &td.path().join("m/Cargo.toml"),
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\
+             [dependencies]\nmember_only = \"2\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["member_only", "root_only"]);
+    }
+
+    #[test]
+    fn workspace_glob_member_pattern_expands() {
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        write(
+            &td.path().join("crates/one/Cargo.toml"),
+            "[package]\nname = \"one\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1\"\n",
+        );
+        write(
+            &td.path().join("crates/two/Cargo.toml"),
+            "[package]\nname = \"two\"\nversion = \"0.1.0\"\n[dependencies]\ntokio = \"1\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["serde", "tokio"]);
+    }
+
+    #[test]
+    fn workspace_missing_member_directory_is_skipped_not_errored() {
+        // Cargo would error on a missing member, but this tool is more lenient:
+        // we skip missing members so a partially-cloned repo still gives useful output.
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"present\", \"absent\"]\n",
+        );
+        write(
+            &td.path().join("present/Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["serde"]);
+    }
+
+    #[test]
+    fn non_workspace_manifest_still_parses_normally() {
+        // Regression guard: single-crate repos must not be affected by workspace logic.
+        let td = TempDir::new().unwrap();
+        write(
+            &td.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1\"\n",
+        );
+
+        let deps = parse_manifest(&td.path().join("Cargo.toml")).unwrap();
+        assert_eq!(dep_names(&deps), vec!["serde"]);
+    }
+
+    // ---------------- simple_glob_match ----------------
+
+    #[test]
+    fn glob_star_matches_any_sequence() {
+        assert!(simple_glob_match("foo", "*"));
+        assert!(simple_glob_match("", "*"));
+        assert!(simple_glob_match("foobar", "foo*"));
+        assert!(simple_glob_match("foobar", "*bar"));
+        assert!(simple_glob_match("foobar", "*o*a*"));
+    }
+
+    #[test]
+    fn glob_question_matches_single_char() {
+        assert!(simple_glob_match("foo", "f?o"));
+        assert!(!simple_glob_match("fo", "f?o"));
+        assert!(!simple_glob_match("fooo", "f?o"));
+    }
+
+    #[test]
+    fn glob_literal_must_match_exactly() {
+        assert!(simple_glob_match("foo", "foo"));
+        assert!(!simple_glob_match("foo", "bar"));
+        assert!(!simple_glob_match("foobar", "foo"));
+    }
+
     // ---------------- locked_versions_from_str ----------------
 
     #[test]
@@ -1406,6 +1607,33 @@ version = "1.0.210"
         assert!(locked_versions_from_str("", "serde").is_empty());
     }
 
+    // ---------------- build_pkg_spec ----------------
+
+    #[test]
+    fn build_pkg_spec_returns_bare_name_when_single_locked_version() {
+        let locked = vec!["2.0.119".to_string()];
+        assert_eq!(build_pkg_spec("syn", "2.0.117", &locked), "syn");
+    }
+
+    #[test]
+    fn build_pkg_spec_returns_bare_name_when_no_locked_versions() {
+        let locked: Vec<String> = Vec::new();
+        assert_eq!(build_pkg_spec("syn", "2.0.117", &locked), "syn");
+    }
+
+    #[test]
+    fn build_pkg_spec_qualifies_with_matching_major_when_ambiguous() {
+        let locked = vec!["2.0.119".to_string(), "3.0.2".to_string()];
+        assert_eq!(build_pkg_spec("syn", "2.0.117", &locked), "syn@2.0.119");
+        assert_eq!(build_pkg_spec("syn", "3.0.1", &locked), "syn@3.0.2");
+    }
+
+    #[test]
+    fn build_pkg_spec_falls_back_to_first_locked_when_no_major_matches() {
+        let locked = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        assert_eq!(build_pkg_spec("foo", "3.0.0", &locked), "foo@1.0.0");
+    }
+
     // ---------------- read_config_min_age_from_str ----------------
 
     #[test]
@@ -1414,10 +1642,7 @@ version = "1.0.210"
 [registry]
 min-publish-age = "14 days"
 "#;
-        assert_eq!(
-            read_config_min_age_from_str(cfg, "test").unwrap(),
-            Some(14)
-        );
+        assert_eq!(read_config_min_age_from_str(cfg, "test").unwrap(), Some(14));
     }
 
     #[test]
@@ -1488,12 +1713,9 @@ min-publish-age = "gibberish"
         write(&td.path().join("Cargo.toml"), "[package]\nname = \"x\"\n");
         write(&td.path().join(".cargo/config.toml"), CFG_14);
 
-        let (days, path) = find_config_min_age_with_home(
-            &td.path().join("Cargo.toml"),
-            None,
-        )
-        .unwrap()
-        .expect("should find config");
+        let (days, path) = find_config_min_age_with_home(&td.path().join("Cargo.toml"), None)
+            .unwrap()
+            .expect("should find config");
         assert_eq!(days, 14);
         assert!(path.ends_with(".cargo/config.toml"));
     }
@@ -1508,12 +1730,10 @@ min-publish-age = "gibberish"
             "[package]\nname = \"x\"\n",
         );
 
-        let (days, _path) = find_config_min_age_with_home(
-            &td.path().join("subdir/Cargo.toml"),
-            None,
-        )
-        .unwrap()
-        .expect("should find config in parent");
+        let (days, _path) =
+            find_config_min_age_with_home(&td.path().join("subdir/Cargo.toml"), None)
+                .unwrap()
+                .expect("should find config in parent");
         assert_eq!(days, 30);
     }
 
@@ -1528,12 +1748,9 @@ min-publish-age = "gibberish"
             "[package]\nname = \"x\"\n",
         );
 
-        let (days, path) = find_config_min_age_with_home(
-            &td.path().join("child/Cargo.toml"),
-            None,
-        )
-        .unwrap()
-        .expect("should find nearest");
+        let (days, path) = find_config_min_age_with_home(&td.path().join("child/Cargo.toml"), None)
+            .unwrap()
+            .expect("should find nearest");
         assert_eq!(days, 14);
         assert!(path.to_string_lossy().contains("child/.cargo"));
     }
@@ -1548,12 +1765,10 @@ min-publish-age = "gibberish"
         );
         write(&home.path().join("config.toml"), CFG_14);
 
-        let (days, path) = find_config_min_age_with_home(
-            &project.path().join("Cargo.toml"),
-            Some(home.path()),
-        )
-        .unwrap()
-        .expect("should find in cargo home");
+        let (days, path) =
+            find_config_min_age_with_home(&project.path().join("Cargo.toml"), Some(home.path()))
+                .unwrap()
+                .expect("should find in cargo home");
         assert_eq!(days, 14);
         assert!(path.starts_with(home.path()));
     }
@@ -1569,12 +1784,10 @@ min-publish-age = "gibberish"
         write(&project.path().join(".cargo/config.toml"), CFG_14);
         write(&home.path().join("config.toml"), CFG_30); // should be ignored
 
-        let (days, _) = find_config_min_age_with_home(
-            &project.path().join("Cargo.toml"),
-            Some(home.path()),
-        )
-        .unwrap()
-        .expect("project config wins");
+        let (days, _) =
+            find_config_min_age_with_home(&project.path().join("Cargo.toml"), Some(home.path()))
+                .unwrap()
+                .expect("project config wins");
         assert_eq!(days, 14);
     }
 
@@ -1587,11 +1800,9 @@ min-publish-age = "gibberish"
             "[package]\nname = \"x\"\n",
         );
 
-        let found = find_config_min_age_with_home(
-            &project.path().join("Cargo.toml"),
-            Some(home.path()),
-        )
-        .unwrap();
+        let found =
+            find_config_min_age_with_home(&project.path().join("Cargo.toml"), Some(home.path()))
+                .unwrap();
         assert!(found.is_none());
     }
 
@@ -1609,12 +1820,9 @@ min-publish-age = "gibberish"
             "[package]\nname = \"x\"\n",
         );
 
-        let (days, _) = find_config_min_age_with_home(
-            &td.path().join("child/Cargo.toml"),
-            None,
-        )
-        .unwrap()
-        .expect("should fall through to ancestor");
+        let (days, _) = find_config_min_age_with_home(&td.path().join("child/Cargo.toml"), None)
+            .unwrap()
+            .expect("should fall through to ancestor");
         assert_eq!(days, 14);
     }
 
@@ -1625,12 +1833,9 @@ min-publish-age = "gibberish"
         write(&td.path().join(".cargo/config"), CFG_14);
         write(&td.path().join("Cargo.toml"), "[package]\nname = \"x\"\n");
 
-        let (days, path) = find_config_min_age_with_home(
-            &td.path().join("Cargo.toml"),
-            None,
-        )
-        .unwrap()
-        .expect("should find legacy config");
+        let (days, path) = find_config_min_age_with_home(&td.path().join("Cargo.toml"), None)
+            .unwrap()
+            .expect("should find legacy config");
         assert_eq!(days, 14);
         assert!(path.ends_with(".cargo/config"));
     }
@@ -1651,10 +1856,7 @@ min-publish-age = "gibberish"
     #[test]
     fn resolve_min_age_uses_cli_when_provided() {
         let td = TempDir::new().unwrap();
-        write(
-            &td.path().join("Cargo.toml"),
-            "[package]\nname = \"x\"\n",
-        );
+        write(&td.path().join("Cargo.toml"), "[package]\nname = \"x\"\n");
         // Also drop a config that would give a different value — CLI should win.
         write(&td.path().join(".cargo/config.toml"), CFG_30);
 
@@ -1667,10 +1869,7 @@ min-publish-age = "gibberish"
     #[test]
     fn resolve_min_age_rejects_negative_cli_value() {
         let td = TempDir::new().unwrap();
-        write(
-            &td.path().join("Cargo.toml"),
-            "[package]\nname = \"x\"\n",
-        );
+        write(&td.path().join("Cargo.toml"), "[package]\nname = \"x\"\n");
         let cli = cli_with(Some(-1), td.path().join("Cargo.toml"));
         assert!(resolve_min_age(&cli).is_err());
     }
@@ -1702,8 +1901,7 @@ min-publish-age = "gibberish"
             )
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
         assert_eq!(
             versions.iter().map(|v| v.num.as_str()).collect::<Vec<_>>(),
             vec!["1.0.5", "1.0.3", "1.0.0"]
@@ -1726,8 +1924,7 @@ min-publish-age = "gibberish"
             )
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
         let nums: Vec<&str> = versions.iter().map(|v| v.num.as_str()).collect();
         assert_eq!(nums, vec!["1.0.2", "1.0.0"]);
     }
@@ -1749,8 +1946,7 @@ min-publish-age = "gibberish"
             )
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "serde", &server.url()).unwrap();
         let nums: Vec<&str> = versions.iter().map(|v| v.num.as_str()).collect();
         assert_eq!(nums, vec!["1.5.0", "1.0.0"]);
     }
@@ -1769,8 +1965,7 @@ min-publish-age = "gibberish"
             )
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "toml", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "toml", &server.url()).unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].num, "1.1.2+spec-1.1.0");
     }
@@ -1804,8 +1999,7 @@ min-publish-age = "gibberish"
             .with_body(r#"{"versions": []}"#)
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "empty", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "empty", &server.url()).unwrap();
         assert!(versions.is_empty());
     }
 
@@ -1827,15 +2021,16 @@ min-publish-age = "gibberish"
     #[test]
     fn fetch_errors_on_5xx() {
         let mut server = mockito::Server::new();
-        let _m = server
-            .mock("GET", "/broken")
-            .with_status(503)
-            .create();
+        let _m = server.mock("GET", "/broken").with_status(503).create();
 
         let err = fetch_stable_versions_from(&test_client(), "broken", &server.url())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("503") || err.contains("HTTP"), "unexpected: {}", err);
+        assert!(
+            err.contains("503") || err.contains("HTTP"),
+            "unexpected: {}",
+            err
+        );
     }
 
     #[test]
@@ -1850,7 +2045,11 @@ min-publish-age = "gibberish"
         let err = fetch_stable_versions_from(&test_client(), "bad", &server.url())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("JSON") || err.contains("invalid"), "unexpected: {}", err);
+        assert!(
+            err.contains("JSON") || err.contains("invalid"),
+            "unexpected: {}",
+            err
+        );
     }
 
     #[test]
@@ -1894,18 +2093,14 @@ min-publish-age = "gibberish"
             )
             .create();
 
-        let versions =
-            fetch_stable_versions_from(&test_client(), "legacy", &server.url()).unwrap();
+        let versions = fetch_stable_versions_from(&test_client(), "legacy", &server.url()).unwrap();
         assert_eq!(versions.len(), 1);
     }
 
     #[test]
     fn resolve_min_age_returns_none_when_neither_set() {
         let td = TempDir::new().unwrap();
-        write(
-            &td.path().join("Cargo.toml"),
-            "[package]\nname = \"x\"\n",
-        );
+        write(&td.path().join("Cargo.toml"), "[package]\nname = \"x\"\n");
         let cli = cli_with(None, td.path().join("Cargo.toml"));
         // Note: this test can be affected by user's real ~/.cargo/config.toml if
         // it happens to define min-publish-age. Skip assertion in that case.
@@ -2009,7 +2204,8 @@ version = "1.30.0"
             .create();
 
         let td = TempDir::new().unwrap();
-        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
+        let manifest =
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
         // Cargo.lock is holding the too-fresh version.
         let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n";
         let manifest_path = write_manifest_and_lock(&td, manifest, lock);
@@ -2040,7 +2236,8 @@ version = "1.30.0"
             .create();
 
         let td = TempDir::new().unwrap();
-        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nnewcrate = \"0.2\"\n";
+        let manifest =
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nnewcrate = \"0.2\"\n";
         let lock = "[[package]]\nname = \"newcrate\"\nversion = \"0.2.0\"\n";
         let manifest_path = write_manifest_and_lock(&td, manifest, lock);
         let deps = parse_manifest(&manifest_path).unwrap();
@@ -2051,28 +2248,16 @@ version = "1.30.0"
 
     #[test]
     fn check_conflicts_with_dry_run_at_parse_time() {
-        let err = Cli::try_parse_from([
-            "cargo-aged",
-            "--check",
-            "--dry-run",
-            "--min-age",
-            "30",
-        ])
-        .unwrap_err();
+        let err = Cli::try_parse_from(["cargo-aged", "--check", "--dry-run", "--min-age", "30"])
+            .unwrap_err();
         // clap surfaces the conflict as an ArgumentConflict error kind.
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
     fn check_conflicts_with_iterate_at_parse_time() {
-        let err = Cli::try_parse_from([
-            "cargo-aged",
-            "--check",
-            "--iterate",
-            "--min-age",
-            "30",
-        ])
-        .unwrap_err();
+        let err = Cli::try_parse_from(["cargo-aged", "--check", "--iterate", "--min-age", "30"])
+            .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
@@ -2096,7 +2281,8 @@ version = "1.30.0"
             .create();
 
         let td = TempDir::new().unwrap();
-        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
+        let manifest =
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[dependencies]\nserde = \"1.0\"\n";
         // Lock is at the too-fresh version — the "guard would act" case.
         let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n";
         let manifest_path = write_manifest_and_lock(&td, manifest, lock);
@@ -2109,7 +2295,10 @@ version = "1.30.0"
         let after = fs::read(&lock_path).unwrap();
 
         assert_eq!(code, 1);
-        assert_eq!(before, after, "Cargo.lock must be byte-identical after --check");
+        assert_eq!(
+            before, after,
+            "Cargo.lock must be byte-identical after --check"
+        );
     }
 
     #[test]
@@ -2154,10 +2343,7 @@ version = "1.30.0"
             Utc::now(),
             "http://unused.invalid",
         );
-        assert!(matches!(
-            status,
-            DepStatus::Skipped(SkipReason::Pinned(_))
-        ));
+        assert!(matches!(status, DepStatus::Skipped(SkipReason::Pinned(_))));
     }
 
     #[test]
@@ -2190,8 +2376,7 @@ version = "1.30.0"
                 pinned: false,
             },
         };
-        let status =
-            classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
+        let status = classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
         match status {
             DepStatus::Ok { version, .. } => assert_eq!(version, "1.0.100"),
             other => panic!("expected Ok, got {:?}", other),
@@ -2233,8 +2418,7 @@ version = "1.30.0"
                 pinned: false,
             },
         };
-        let status =
-            classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
+        let status = classify_dep(&test_client(), &dep, &manifest_path, 30, now, &server.url());
         match status {
             DepStatus::Fresh {
                 locked_version,
